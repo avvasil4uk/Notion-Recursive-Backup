@@ -2,39 +2,117 @@ import { Client } from '@notionhq/client';
 import { NotionConverter } from 'notion-to-md';
 import fs from 'fs/promises';
 import * as path from 'path';
-import { 
-  CONFIG, 
-  stats, 
-  log, 
-  sleep, 
-  sanitizeFilename, 
-  ensureDir, 
-  generateFrontmatter 
+import {
+  CONFIG,
+  stats,
+  log,
+  sleep,
+  sanitizeFilename,
+  ensureDir,
+  generateFrontmatter
 } from './utils.js';
 
+const NOTION_TOKEN = process.env.NOTION_TOKEN;
+const NOTION_API_VERSION = '2025-09-03';
+
 // Initialize Notion clients
-const notion = new Client({ auth: process.env.NOTION_TOKEN });
+const notion = new Client({ auth: NOTION_TOKEN });
 const n2m = new NotionConverter(notion);
+
+// Prevent notion-to-md from calling legacy databases.query on multi-source databases
+n2m.setCustomTransformer('child_database', async (block) => {
+  const title = block.child_database?.title || 'Untitled Database';
+  return `\n### Database: ${title}\n*(Backed up in subfolder)*\n`;
+});
+
+/**
+ * Helper for Notion 2025-09-03 API requests (supports multi-source databases)
+ */
+async function notionFetch(endpoint, options = {}) {
+  await sleep(CONFIG.API_DELAY);
+  const res = await fetch(`https://notion.com{endpoint}`, {
+    ...options,
+    headers: {
+      'Authorization': `Bearer ${NOTION_TOKEN}`,
+      'Notion-Version': NOTION_API_VERSION,
+      'Content-Type': 'application/json',
+      ...(options.headers || {})
+    }
+  });
+
+  if (!res.ok) {
+    const errBody = await res.text();
+    throw new Error(`Notion API ${res.status} on ${endpoint}: ${errBody}`);
+  }
+  return res.json();
+}
+
+/**
+ * Extract plain-text string from any Notion property value
+ */
+function extractPropertyValue(prop) {
+  if (!prop) return '';
+  switch (prop.type) {
+    case 'title':
+      return (prop.title || []).map(t => t.plain_text).join('');
+    case 'rich_text':
+      return (prop.rich_text || []).map(t => t.plain_text).join('');
+    case 'number':
+      return prop.number ?? '';
+    case 'select':
+      return prop.select?.name || '';
+    case 'multi_select':
+      return (prop.multi_select || []).map(s => s.name).join(', ');
+    case 'status':
+      return prop.status?.name || '';
+    case 'date':
+      if (!prop.date) return '';
+      return prop.date.end ? `${prop.date.start} -> ${prop.date.end}` : prop.date.start;
+    case 'checkbox':
+      return prop.checkbox ? 'Yes' : 'No';
+    case 'url':
+      return prop.url || '';
+    case 'email':
+      return prop.email || '';
+    case 'phone_number':
+      return prop.phone_number || '';
+    case 'relation':
+      return (prop.relation || []).map(r => r.id).join(', ');
+    case 'people':
+      return (prop.people || []).map(p => p.name || p.id).join(', ');
+    case 'files':
+      return (prop.files || []).map(f => f.name || f.file?.url || f.external?.url || '').join(', ');
+    case 'formula':
+      return prop.formula?.[prop.formula.type] ?? '';
+    case 'rollup':
+      if (prop.rollup?.type === 'array') {
+        return (prop.rollup.array || []).map(item => extractPropertyValue(item)).join(', ');
+      }
+      return prop.rollup?.[prop.rollup?.type] ?? '';
+    case 'created_time':
+      return prop.created_time || '';
+    case 'last_edited_time':
+      return prop.last_edited_time || '';
+    case 'unique_id':
+      return prop.unique_id ? `${prop.unique_id.prefix || ''}${prop.unique_id.number}` : '';
+    default:
+      return '';
+  }
+}
 
 /**
  * Get page title from Notion API with robust error handling
- * Handles both regular pages and database pages
- * @param {string} pageId - Notion page ID
- * @returns {Promise<string>} Page title or fallback
  */
 export async function getPageTitle(pageId) {
   try {
     await sleep(CONFIG.API_DELAY);
     const page = await notion.pages.retrieve({ page_id: pageId });
-    
-    const properties = page.properties;
-    
+    const properties = page.properties || {};
     const titleProp = Object.values(properties).find(prop => prop.type === 'title');
-    
+
     if (titleProp?.title?.length > 0) {
-      return titleProp.title[0].plain_text;
-    } 
-    
+      return titleProp.title.map(t => t.plain_text).join('');
+    }
     return `Untitled-${pageId.substring(0, 8)}`;
   } catch (error) {
     log.error(`Failed to retrieve title for ${pageId}: ${error.message}`);
@@ -43,14 +121,13 @@ export async function getPageTitle(pageId) {
 }
 
 /**
- * Get all child pages of a block with pagination support
- * @param {string} blockId - Parent block ID
- * @returns {Promise<Array>} Array of child page objects
+ * Get all child pages AND child databases of a block with pagination support
  */
-export async function getChildPages(blockId) {
-  const children = [];
+export async function getChildItems(blockId) {
+  const childPages = [];
+  const childDatabases = [];
   let cursor = undefined;
-  
+
   try {
     do {
       await sleep(CONFIG.API_DELAY);
@@ -59,43 +136,44 @@ export async function getChildPages(blockId) {
         start_cursor: cursor,
         page_size: 100
       });
-      //log.debug(`Children list:\n${JSON.stringify(response, null, 2)}\n`);
-      
+
       if (response.results?.length) {
         for (const block of response.results) {
           if (block.type === 'child_page') {
-            log.debug(`Retrivied child page ${block.child_page.title}`);
-            children.push({
+            childPages.push({
               id: block.id,
-              title: block.child_page.title
+              title: block.child_page.title || 'Untitled'
             });
-          }
-          else if (block.has_children){
-            const childPages = await getChildPages(block.id);
-            children.push(...childPages)
+          } else if (block.type === 'child_database') {
+            childDatabases.push({
+              id: block.id,
+              title: block.child_database.title || 'Untitled Database'
+            });
+          } else if (block.has_children) {
+            const nested = await getChildItems(block.id);
+            childPages.push(...nested.childPages);
+            childDatabases.push(...nested.childDatabases);
           }
         }
       }
-      
+
       cursor = response.next_cursor;
     } while (cursor);
-    
-    return children;
+
+    return { childPages, childDatabases };
   } catch (error) {
-    log.error(`Failed to retrieve child pages for ${blockId}: ${error.message}`);
-    return [];
+    log.error(`Failed to retrieve child items for ${blockId}: ${error.message}`);
+    return { childPages: [], childDatabases: [] };
   }
 }
 
 /**
  * Convert a Notion page to markdown string
- * @param {string} pageId - Notion page ID
- * @returns {Promise<string>} Markdown content
  */
 export async function convertPageToMarkdown(pageId) {
   try {
     await sleep(CONFIG.API_DELAY);
-    const page = await n2m.convert(pageId); 
+    const page = await n2m.convert(pageId);
     return page.content;
   } catch (error) {
     log.error(`Failed to convert page ${pageId}: ${error.message}`);
@@ -104,86 +182,191 @@ export async function convertPageToMarkdown(pageId) {
 }
 
 /**
- * Process a single page: convert and save to file
- * @param {string} pageId - Notion page ID
- * @param {string} parentPath - Output directory path
- * @param {number} level - Nesting level for logging
- * @returns {Promise<Object>} Object with title and filename
+ * Query all rows across all data sources of a Notion database (2025-09-03 API)
  */
-export async function processPage(pageId, parentPath, level) {
+async function queryDatabaseRows(databaseId) {
+  const dbInfo = await notionFetch(`/databases/${databaseId}`);
+  const dataSources = dbInfo.data_sources || [];
+  const allRows = [];
+  const seenRowIds = new Set();
+
+  if (dataSources.length === 0) {
+    // Fallback if database has no data_sources array
+    let cursor = undefined;
+    do {
+      const body = cursor ? { start_cursor: cursor, page_size: 100 } : { page_size: 100 };
+      const res = await notionFetch(`/databases/${databaseId}/query`, {
+        method: 'POST',
+        body: JSON.stringify(body)
+      });
+      for (const row of res.results || []) {
+        if (!seenRowIds.has(row.id)) {
+          seenRowIds.add(row.id);
+          allRows.push(row);
+        }
+      }
+      cursor = res.next_cursor;
+    } while (cursor);
+    return { dbInfo, rows: allRows };
+  }
+
+  for (const ds of dataSources) {
+    let cursor = undefined;
+    do {
+      const body = cursor ? { start_cursor: cursor, page_size: 100 } : { page_size: 100 };
+      const res = await notionFetch(`/data_sources/${ds.id}/query`, {
+        method: 'POST',
+        body: JSON.stringify(body)
+      });
+      for (const row of res.results || []) {
+        if (!seenRowIds.has(row.id)) {
+          seenRowIds.add(row.id);
+          allRows.push(row);
+        }
+      }
+      cursor = res.next_cursor;
+    } while (cursor);
+  }
+
+  return { dbInfo, rows: allRows };
+}
+
+/**
+ * Export a database (including multi-source databases) to Markdown + CSV and back up its rows
+ */
+export async function processDatabase(databaseId, dbTitle, parentPath, level) {
   const indent = '  '.repeat(level);
-  
   try {
-    log.info(`${indent}Processing: ${pageId}`);
-    
-    const title = await getPageTitle(pageId);
-    log.debug(`${indent}Title: "${title}"`);
-    
-    const markdown = await convertPageToMarkdown(pageId);
-    
-    const frontmatter = generateFrontmatter(title, pageId, parentPath, level);
-    const fullMarkdown = frontmatter + markdown;
-    
-    await ensureDir(parentPath);
-    const filename = sanitizeFilename(title) + '.md';
-    const filepath = path.join(parentPath, filename);
-    await fs.writeFile(filepath, fullMarkdown, 'utf8');
-    
-    log.success(`${indent}Saved: ${filename}`);
+    log.info(`${indent}Processing Database: "${dbTitle}" (${databaseId})`);
+    const { dbInfo, rows } = await queryDatabaseRows(databaseId);
+    const resolvedTitle =
+      (dbInfo.title || []).map(t => t.plain_text).join('') || dbTitle || 'Untitled-Database';
+
+    const safeName = sanitizeFilename(resolvedTitle);
+    const dbDir = path.join(parentPath, safeName);
+    await ensureDir(dbDir);
+
+    // Collect all unique property column names across rows
+    const columnSet = new Set();
+    for (const row of rows) {
+      Object.keys(row.properties || {}).forEach(k => columnSet.add(k));
+    }
+    const columns = Array.from(columnSet);
+
+    // Build Markdown table + CSV
+    const mdLines = [
+      generateFrontmatter(resolvedTitle, databaseId, parentPath, level).trimEnd(),
+      '',
+      `# ${resolvedTitle}`,
+      '',
+      `Total rows: **${rows.length}**`,
+      ''
+    ];
+
+    const csvRows = [];
+    if (columns.length > 0) {
+      const escapeMd = (v) => String(v ?? '').replace(/\|/g, '\\|').replace(/\r?\n/g, ' ');
+      const escapeCsv = (v) => `"${String(v ?? '').replace(/"/g, '""')}"`;
+
+      mdLines.push(`| ${columns.map(escapeMd).join(' | ')} |`);
+      mdLines.push(`| ${columns.map(() => '---').join(' | ')} |`);
+      csvRows.push(columns.map(escapeCsv).join(','));
+
+      for (const row of rows) {
+        const values = columns.map(col => extractPropertyValue(row.properties?.[col]));
+        mdLines.push(`| ${values.map(escapeMd).join(' | ')} |`);
+        csvRows.push(values.map(escapeCsv).join(','));
+      }
+    }
+
+    await fs.writeFile(path.join(dbDir, `${safeName}.md`), mdLines.join('\n') + '\n', 'utf8');
+    if (csvRows.length > 0) {
+      await fs.writeFile(path.join(dbDir, `${safeName}.csv`), csvRows.join('\n') + '\n', 'utf8');
+    }
+
+    log.success(`${indent}Saved Database (${rows.length} rows): ${safeName}`);
     stats.pagesProcessed++;
-    
-    return { title, filename };
+
+    // Recursively back up each database row's page content
+    for (const row of rows) {
+      try {
+        await processPageRecursively(row.id, dbDir, level + 1);
+      } catch (rowErr) {
+        log.error(`${indent}  Row page ${row.id} failed: ${rowErr.message}`);
+        stats.errors++;
+      }
+    }
   } catch (error) {
-    log.error(`${indent}Failed to process page: ${error.message}`);
+    log.error(`${indent}Failed to process database "${dbTitle}" (${databaseId}): ${error.message}`);
     stats.errors++;
-    throw error;
   }
 }
 
 /**
- * Process a page and all its children recursively
- * @param {string} pageId - Root page ID
- * @param {string} parentPath - Output directory path
- * @param {number} level - Current nesting level
+ * Process a single page: convert and save to file
  */
-export async function processPageRecursively(pageId, parentPath = CONFIG.OUTPUT_DIR, level = 0) {
+export async function processPage(pageId, parentPath, level) {
   const indent = '  '.repeat(level);
-  
+
   try {
-    const { title } = await processPage(pageId, parentPath, level);
-    
-    const childPages = await getChildPages(pageId);
-    
-    if (childPages.length > 0) {
-      log.info(`${indent}Found ${childPages.length} child page(s)`);
-      
-      const childDir = path.join(parentPath, sanitizeFilename(title));
-      await ensureDir(childDir);
-      
-      if (CONFIG.PARALLEL_PROCESSING) {
-        // Process children in parallel for better performance
-        const childPromises = childPages.map(child =>
-          processPageRecursively(child.id, childDir, level + 1)
-            .catch(error => {
-              log.error(`${indent}  Child page ${child.id} failed: ${error.message}`);
-              stats.errors++;
-            })
-        );
-        await Promise.all(childPromises);
-      } else {
-        // Process children sequentially (safer but slower)
-        for (const child of childPages) {
-          try {
-            await processPageRecursively(child.id, childDir, level + 1);
-          } catch (error) {
-            log.error(`${indent}  Child page ${child.id} failed: ${error.message}`);
-            stats.errors++;
-          }
-        }
-      }
-    }
-  } catch (error) {
-    log.error(`${indent}Failed to process page tree: ${error.message}`);
-    stats.errors++;
-  }
+    log.info(`${indent}Processing: ${pageId}`);
+
+    const title = await getPageTitle(pageId);
+    log.debug(`${indent}Title: "${title}"`);
+
+const markdown = await convertPageToMarkdown(pageId);
+const frontmatter = generateFrontmatter(title, pageId, parentPath, level);
+const fullMarkdown = frontmatter + markdown;
+await ensureDir(parentPath);
+const filename = sanitizeFilename(title) + '.md';
+const filepath = path.join(parentPath, filename);
+await fs.writeFile(filepath, fullMarkdown, 'utf8');
+log.success(${indent}Saved: ${filename});
+stats.pagesProcessed++;
+return { title, filename };
+} catch (error) {
+log.error(${indent}Failed to process page: ${error.message});
+stats.errors++;
+throw error;
+}
+}
+/**
+• Process a page and all its child pages and databases recursively
+*/
+export async function processPageRecursively(pageId, parentPath = CONFIG.OUTPUT_DIR, level = 0) {
+const indent = '  '.repeat(level);
+try {
+const { title } = await processPage(pageId, parentPath, level);
+const { childPages, childDatabases } = await getChildItems(pageId);
+if (childPages.length > 0 || childDatabases.length > 0) {
+log.info(${indent}Found ${childPages.length} child page(s) and ${childDatabases.length} database(s));
+const childDir = path.join(parentPath, sanitizeFilename(title));
+await ensureDir(childDir);
+for (const db of childDatabases) {
+await processDatabase(db.id, db.title, childDir, level + 1);
+}
+if (CONFIG.PARALLEL_PROCESSING) {
+const childPromises = childPages.map(child =>
+processPageRecursively(child.id, childDir, level + 1)
+.catch(error => {
+log.error(${indent}  Child page ${child.id} failed: ${error.message});
+stats.errors++;
+})
+);
+await Promise.all(childPromises);
+} else {
+for (const child of childPages) {
+try {
+await processPageRecursively(child.id, childDir, level + 1);
+} catch (error) {
+log.error(${indent}  Child page ${child.id} failed: ${error.message});
+stats.errors++;
+}
+}
+}
+}
+} catch (error) {
+log.error(${indent}Failed to process page tree: ${error.message});
+stats.errors++;
+}
 }
