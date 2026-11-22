@@ -15,16 +15,6 @@ import {
 const NOTION_TOKEN = process.env.NOTION_TOKEN;
 const NOTION_API_VERSION = '2025-09-03';
 
-const notion = new Client({ auth: NOTION_TOKEN });
-const n2m = new NotionConverter(notion);
-
-if (typeof n2m.setCustomTransformer === 'function') {
-  n2m.setCustomTransformer('child_database', async (block) => {
-    const title = (block.child_database && block.child_database.title) || 'Untitled Database';
-    return '\n### Database: ' + title + '\n*(Backed up in subfolder)*\n';
-  });
-}
-
 async function notionFetch(endpoint, options = {}) {
   await sleep(CONFIG.API_DELAY);
   const res = await fetch('https://notion.com' + endpoint, {
@@ -43,6 +33,76 @@ async function notionFetch(endpoint, options = {}) {
   }
   return res.json();
 }
+
+async function queryDatabaseRows(databaseId) {
+  const dbInfo = await notionFetch('/databases/' + databaseId);
+  const dataSources = dbInfo.data_sources || [];
+  const allRows = [];
+  const seenRowIds = new Set();
+
+  if (dataSources.length === 0) {
+    let cursor = undefined;
+    do {
+      const body = cursor ? { start_cursor: cursor, page_size: 100 } : { page_size: 100 };
+      const res = await notionFetch('/databases/' + databaseId + '/query', {
+        method: 'POST',
+        body: JSON.stringify(body)
+      });
+      for (const row of (res.results || [])) {
+        if (!seenRowIds.has(row.id)) {
+          seenRowIds.add(row.id);
+          allRows.push(row);
+        }
+      }
+      cursor = res.next_cursor;
+    } while (cursor);
+    return { dbInfo, rows: allRows };
+  }
+
+  for (const ds of dataSources) {
+    let cursor = undefined;
+    do {
+      const body = cursor ? { start_cursor: cursor, page_size: 100 } : { page_size: 100 };
+      const res = await notionFetch('/data_sources/' + ds.id + '/query', {
+        method: 'POST',
+        body: JSON.stringify(body)
+      });
+      for (const row of (res.results || [])) {
+        if (!seenRowIds.has(row.id)) {
+          seenRowIds.add(row.id);
+          allRows.push(row);
+        }
+      }
+      cursor = res.next_cursor;
+    } while (cursor);
+  }
+
+  return { dbInfo, rows: allRows };
+}
+
+// Initialize Notion client and intercept legacy database calls for notion-to-md
+const notion = new Client({ auth: NOTION_TOKEN });
+
+const originalDbRetrieve = notion.databases.retrieve.bind(notion.databases);
+notion.databases.retrieve = async (args) => {
+  try {
+    return await notionFetch('/databases/' + args.database_id);
+  } catch (err) {
+    return originalDbRetrieve(args);
+  }
+};
+
+notion.databases.query = async (args) => {
+  const { rows } = await queryDatabaseRows(args.database_id);
+  return {
+    object: 'list',
+    results: rows,
+    next_cursor: null,
+    has_more: false
+  };
+};
+
+const n2m = new NotionConverter(notion);
 
 function extractPropertyValue(prop) {
   if (!prop) return '';
@@ -166,52 +226,6 @@ export async function convertPageToMarkdown(pageId) {
   }
 }
 
-async function queryDatabaseRows(databaseId) {
-  const dbInfo = await notionFetch('/databases/' + databaseId);
-  const dataSources = dbInfo.data_sources || [];
-  const allRows = [];
-  const seenRowIds = new Set();
-
-  if (dataSources.length === 0) {
-    let cursor = undefined;
-    do {
-      const body = cursor ? { start_cursor: cursor, page_size: 100 } : { page_size: 100 };
-      const res = await notionFetch('/databases/' + databaseId + '/query', {
-        method: 'POST',
-        body: JSON.stringify(body)
-      });
-      for (const row of (res.results || [])) {
-        if (!seenRowIds.has(row.id)) {
-          seenRowIds.add(row.id);
-          allRows.push(row);
-        }
-      }
-      cursor = res.next_cursor;
-    } while (cursor);
-    return { dbInfo, rows: allRows };
-  }
-
-  for (const ds of dataSources) {
-    let cursor = undefined;
-    do {
-      const body = cursor ? { start_cursor: cursor, page_size: 100 } : { page_size: 100 };
-      const res = await notionFetch('/data_sources/' + ds.id + '/query', {
-        method: 'POST',
-        body: JSON.stringify(body)
-      });
-      for (const row of (res.results || [])) {
-        if (!seenRowIds.has(row.id)) {
-          seenRowIds.add(row.id);
-          allRows.push(row);
-        }
-      }
-      cursor = res.next_cursor;
-    } while (cursor);
-  }
-
-  return { dbInfo, rows: allRows };
-}
-
 export async function processDatabase(databaseId, dbTitle, parentPath, level) {
   const indent = '  '.repeat(level);
   try {
@@ -294,15 +308,13 @@ export async function processPage(pageId, parentPath, level) {
     await ensureDir(parentPath);
     const filename = sanitizeFilename(title) + '.md';
     const filepath = path.join(parentPath, filename);
-    await fs.writeFile(filepath, fullMarkdown, 'utf8');
-
-    log.success(indent + 'Saved: ' + filename);
-    stats.pagesProcessed++;
-
-    return { title, filename };
-  } catch (error) {
-    log.error(indent + 'Failed to process page: ' + error.message);
-    stats.errors++;
+await fs.writeFile(filepath, fullMarkdown, 'utf8');
+log.success(indent + 'Saved: ' + filename);
+stats.pagesProcessed++;
+return { title, filename };
+} catch (error) {
+log.error(indent + 'Failed to process page: ' + error.message);
+stats.errors++;
 throw error;
 }
 }
