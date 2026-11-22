@@ -80,26 +80,27 @@ async function queryDatabaseRows(databaseId) {
   return { dbInfo, rows: allRows };
 }
 
-// Initialize Notion client and intercept legacy database calls for notion-to-md
+// Initialize Notion client and intercept ALL low-level HTTP calls made by notion-to-md
 const notion = new Client({ auth: NOTION_TOKEN });
+const originalRequest = notion.request.bind(notion);
 
-const originalDbRetrieve = notion.databases.retrieve.bind(notion.databases);
-notion.databases.retrieve = async (args) => {
-  try {
-    return await notionFetch('/databases/' + args.database_id);
-  } catch (err) {
-    return originalDbRetrieve(args);
+notion.request = async (args) => {
+  const reqPath = (args && args.path) ? String(args.path).replace(/^\/+/, '') : '';
+  const queryMatch = reqPath.match(/^databases\/([^/]+)\/query$/);
+  if (queryMatch) {
+    const { rows } = await queryDatabaseRows(queryMatch[1]);
+    return {
+      object: 'list',
+      results: rows,
+      next_cursor: null,
+      has_more: false
+    };
   }
-};
-
-notion.databases.query = async (args) => {
-  const { rows } = await queryDatabaseRows(args.database_id);
-  return {
-    object: 'list',
-    results: rows,
-    next_cursor: null,
-    has_more: false
-  };
+  const dbMatch = reqPath.match(/^databases\/([^/]+)$/);
+  if (dbMatch && (!args.method || args.method.toUpperCase() === 'GET')) {
+    return await notionFetch('/databases/' + dbMatch[1]);
+  }
+  return originalRequest(args);
 };
 
 const n2m = new NotionConverter(notion);
@@ -303,11 +304,10 @@ export async function processPage(pageId, parentPath, level) {
     const markdown = await convertPageToMarkdown(pageId);
 
     const frontmatter = generateFrontmatter(title, pageId, parentPath, level);
-    const fullMarkdown = frontmatter + markdown;
-
-    await ensureDir(parentPath);
-    const filename = sanitizeFilename(title) + '.md';
-    const filepath = path.join(parentPath, filename);
+const fullMarkdown = frontmatter + markdown;
+await ensureDir(parentPath);
+const filename = sanitizeFilename(title) + '.md';
+const filepath = path.join(parentPath, filename);
 await fs.writeFile(filepath, fullMarkdown, 'utf8');
 log.success(indent + 'Saved: ' + filename);
 stats.pagesProcessed++;
