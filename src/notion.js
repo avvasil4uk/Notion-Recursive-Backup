@@ -15,6 +15,9 @@ import {
 const NOTION_TOKEN = process.env.NOTION_TOKEN;
 const NOTION_API_VERSION = '2025-09-03';
 
+const notion = new Client({ auth: NOTION_TOKEN });
+const n2m = new NotionConverter(notion);
+
 async function notionFetch(endpoint, options = {}) {
   await sleep(CONFIG.API_DELAY);
   const res = await fetch('https://notion.com' + endpoint, {
@@ -32,6 +35,115 @@ async function notionFetch(endpoint, options = {}) {
     throw new Error('Notion API ' + res.status + ' on ' + endpoint + ': ' + errBody);
   }
   return res.json();
+}
+
+function richTextToMarkdown(richTextArr) {
+  if (!Array.isArray(richTextArr)) return '';
+  return richTextArr.map(t => {
+    let text = t.plain_text || '';
+    if (!text) return '';
+    const ann = t.annotations || {};
+    if (ann.code) text = '`' + text + '`';
+    if (ann.bold) text = '**' + text + '**';
+    if (ann.italic) text = '*' + text + '*';
+    if (ann.strikethrough) text = '~~' + text + '~~';
+    if (t.href) text = '[' + text + '](' + t.href + ')';
+    return text;
+  }).join('');
+}
+
+async function fallbackBlocksToMarkdown(blockId, depth = 0) {
+  const lines = [];
+  const prefix = '  '.repeat(depth);
+  let cursor = undefined;
+
+  do {
+    const query = cursor ? '?page_size=100&start_cursor=' + encodeURIComponent(cursor) : '?page_size=100';
+    const res = await notionFetch('/blocks/' + blockId + '/children' + query);
+
+    for (const block of (res.results || [])) {
+      const type = block.type;
+      const data = block[type] || {};
+      const text = richTextToMarkdown(data.rich_text);
+
+      switch (type) {
+        case 'paragraph':
+          lines.push(prefix + text);
+          lines.push('');
+          break;
+        case 'heading_1':
+          lines.push(prefix + '# ' + text);
+          lines.push('');
+          break;
+        case 'heading_2':
+          lines.push(prefix + '## ' + text);
+          lines.push('');
+          break;
+        case 'heading_3':
+          lines.push(prefix + '### ' + text);
+          lines.push('');
+          break;
+        case 'bulleted_list_item':
+          lines.push(prefix + '- ' + text);
+          break;
+        case 'numbered_list_item':
+          lines.push(prefix + '1. ' + text);
+          break;
+        case 'to_do':
+          lines.push(prefix + '- [' + (data.checked ? 'x' : ' ') + '] ' + text);
+          break;
+        case 'toggle':
+          lines.push(prefix + '> **' + text + '**');
+          break;
+        case 'quote':
+          lines.push(prefix + '> ' + text);
+          lines.push('');
+          break;
+        case 'callout':
+          lines.push(prefix + '> 💡 ' + text);
+          lines.push('');
+          break;
+        case 'code':
+          lines.push(prefix + '```' + (data.language || ''));
+          lines.push(text);
+          lines.push(prefix + '```');
+          lines.push('');
+          break;
+        case 'divider':
+          lines.push(prefix + '---');
+          lines.push('');
+          break;
+        case 'child_page':
+          lines.push(prefix + '- 📄 **[' + (data.title || 'Subpage') + ']**');
+          break;
+        case 'child_database':
+          lines.push(prefix + '- 🗄️ **Database: ' + (data.title || 'Untitled Database') + '** *(exported in subfolder)*');
+          break;
+        case 'bookmark':
+        case 'embed':
+        case 'link_preview':
+          if (data.url) lines.push(prefix + '[' + data.url + '](' + data.url + ')');
+          break;
+        case 'image': {
+          const url = (data.file && data.file.url) || (data.external && data.external.url) || '';
+          if (url) lines.push(prefix + '!(' + url + ')');
+          break;
+        }
+        default:
+          if (text) lines.push(prefix + text);
+          break;
+      }
+
+      if (block.has_children && type !== 'child_page' && type !== 'child_database') {
+        const childMd = await fallbackBlocksToMarkdown(block.id, depth + 1);
+        if (childMd) lines.push(childMd);
+      }
+    }
+
+    cursor = res.next_cursor;
+  } while (cursor);
+
+  return lines.join('\n');
 }
 
 async function queryDatabaseRows(databaseId) {
@@ -79,31 +191,6 @@ async function queryDatabaseRows(databaseId) {
 
   return { dbInfo, rows: allRows };
 }
-
-// Initialize Notion client and intercept ALL low-level HTTP calls made by notion-to-md
-const notion = new Client({ auth: NOTION_TOKEN });
-const originalRequest = notion.request.bind(notion);
-
-notion.request = async (args) => {
-  const reqPath = (args && args.path) ? String(args.path).replace(/^\/+/, '') : '';
-  const queryMatch = reqPath.match(/^databases\/([^/]+)\/query$/);
-  if (queryMatch) {
-    const { rows } = await queryDatabaseRows(queryMatch[1]);
-    return {
-      object: 'list',
-      results: rows,
-      next_cursor: null,
-      has_more: false
-    };
-  }
-  const dbMatch = reqPath.match(/^databases\/([^/]+)$/);
-  if (dbMatch && (!args.method || args.method.toUpperCase() === 'GET')) {
-    return await notionFetch('/databases/' + dbMatch[1]);
-  }
-  return originalRequest(args);
-};
-
-const n2m = new NotionConverter(notion);
 
 function extractPropertyValue(prop) {
   if (!prop) return '';
@@ -157,8 +244,7 @@ function extractPropertyValue(prop) {
 
 export async function getPageTitle(pageId) {
   try {
-    await sleep(CONFIG.API_DELAY);
-    const page = await notion.pages.retrieve({ page_id: pageId });
+    const page = await notionFetch('/pages/' + pageId);
     const properties = page.properties || {};
     const titleProp = Object.values(properties).find(prop => prop.type === 'title');
 
@@ -179,12 +265,8 @@ export async function getChildItems(blockId) {
 
   try {
     do {
-      await sleep(CONFIG.API_DELAY);
-      const response = await notion.blocks.children.list({
-        block_id: blockId,
-        start_cursor: cursor,
-        page_size: 100
-      });
+      const query = cursor ? '?page_size=100&start_cursor=' + encodeURIComponent(cursor) : '?page_size=100';
+      const response = await notionFetch('/blocks/' + blockId + '/children' + query);
 
       if (response.results && response.results.length) {
         for (const block of response.results) {
@@ -222,88 +304,74 @@ export async function convertPageToMarkdown(pageId) {
     const page = await n2m.convert(pageId);
     return page.content;
   } catch (error) {
-    log.error('Failed to convert page ' + pageId + ': ' + error.message);
-    throw error;
+    log.warn('notion-to-md failed on ' + pageId + ' (' + error.message + '), using 2025-09-03 fallback converter');
+    return await fallbackBlocksToMarkdown(pageId);
   }
 }
 
 export async function processDatabase(databaseId, dbTitle, parentPath, level) {
-  const indent = '  '.repeat(level);
-  try {
-    log.info(indent + 'Processing Database: "' + dbTitle + '" (' + databaseId + ')');
-    const { dbInfo, rows } = await queryDatabaseRows(databaseId);
-    const resolvedTitle =
-      (dbInfo.title || []).map(t => t.plain_text).join('') || dbTitle || 'Untitled-Database';
-
-    const safeName = sanitizeFilename(resolvedTitle);
-    const dbDir = path.join(parentPath, safeName);
-    await ensureDir(dbDir);
-
-    const columnSet = new Set();
-    for (const row of rows) {
-      Object.keys(row.properties || {}).forEach(k => columnSet.add(k));
-    }
-    const columns = Array.from(columnSet);
-
-    const mdLines = [
-      generateFrontmatter(resolvedTitle, databaseId, parentPath, level).trimEnd(),
-      '',
-      '# ' + resolvedTitle,
-      '',
-      'Total rows: **' + rows.length + '**',
-      ''
-    ];
-
-    const csvRows = [];
-    if (columns.length > 0) {
-      const escapeMd = (v) => String(v ?? '').replace(/\|/g, '\\|').replace(/\r?\n/g, ' ');
-      const escapeCsv = (v) => '"' + String(v ?? '').replace(/"/g, '""') + '"';
-
-      mdLines.push('| ' + columns.map(escapeMd).join(' | ') + ' |');
-      mdLines.push('| ' + columns.map(() => '---').join(' | ') + ' |');
-      csvRows.push(columns.map(escapeCsv).join(','));
-
-      for (const row of rows) {
-        const values = columns.map(col => extractPropertyValue(row.properties && row.properties[col]));
-        mdLines.push('| ' + values.map(escapeMd).join(' | ') + ' |');
-        csvRows.push(values.map(escapeCsv).join(','));
-      }
-    }
-
-    await fs.writeFile(path.join(dbDir, safeName + '.md'), mdLines.join('\n') + '\n', 'utf8');
-    if (csvRows.length > 0) {
-      await fs.writeFile(path.join(dbDir, safeName + '.csv'), csvRows.join('\n') + '\n', 'utf8');
-    }
-
-    log.success(indent + 'Saved Database (' + rows.length + ' rows): ' + safeName);
-    stats.pagesProcessed++;
-
-    for (const row of rows) {
-      try {
-        await processPageRecursively(row.id, dbDir, level + 1);
-      } catch (rowErr) {
-        log.error(indent + '  Row page ' + row.id + ' failed: ' + rowErr.message);
-        stats.errors++;
-      }
-    }
-  } catch (error) {
-    log.error(indent + 'Failed to process database "' + dbTitle + '" (' + databaseId + '): ' + error.message);
-    stats.errors++;
-  }
+const indent = '  '.repeat(level);
+try {
+log.info(indent + 'Processing Database: "' + dbTitle + '" (' + databaseId + ')');
+const { dbInfo, rows } = await queryDatabaseRows(databaseId);
+const resolvedTitle =
+(dbInfo.title || []).map(t => t.plain_text).join('') || dbTitle || 'Untitled-Database';
+const safeName = sanitizeFilename(resolvedTitle);
+const dbDir = path.join(parentPath, safeName);
+await ensureDir(dbDir);
+const columnSet = new Set();
+for (const row of rows) {
+Object.keys(row.properties || {}).forEach(k => columnSet.add(k));
 }
-
+const columns = Array.from(columnSet);
+const mdLines = [
+generateFrontmatter(resolvedTitle, databaseId, parentPath, level).trimEnd(),
+'',
+'# ' + resolvedTitle,
+'',
+'Total rows: ' + rows.length + '',
+''
+];
+const csvRows = [];
+if (columns.length > 0) {
+const escapeMd = (v) => String(v ?? '').replace(/|/g, '\|').replace(/\r?\n/g, ' ');
+const escapeCsv = (v) => '"' + String(v ?? '').replace(/"/g, '""') + '"';
+mdLines.push('| ' + columns.map(escapeMd).join(' | ') + ' |');
+mdLines.push('| ' + columns.map(() => '---').join(' | ') + ' |');
+csvRows.push(columns.map(escapeCsv).join(','));
+for (const row of rows) {
+const values = columns.map(col => extractPropertyValue(row.properties && row.properties[col]));
+mdLines.push('| ' + values.map(escapeMd).join(' | ') + ' |');
+csvRows.push(values.map(escapeCsv).join(','));
+}
+}
+await fs.writeFile(path.join(dbDir, safeName + '.md'), mdLines.join('\n') + '\n', 'utf8');
+if (csvRows.length > 0) {
+await fs.writeFile(path.join(dbDir, safeName + '.csv'), csvRows.join('\n') + '\n', 'utf8');
+}
+log.success(indent + 'Saved Database (' + rows.length + ' rows): ' + safeName);
+stats.pagesProcessed++;
+for (const row of rows) {
+try {
+await processPageRecursively(row.id, dbDir, level + 1);
+} catch (rowErr) {
+log.error(indent + '  Row page ' + row.id + ' failed: ' + rowErr.message);
+stats.errors++;
+}
+}
+} catch (error) {
+log.error(indent + 'Failed to process database "' + dbTitle + '" (' + databaseId + '): ' + error.message);
+stats.errors++;
+}
+}
 export async function processPage(pageId, parentPath, level) {
-  const indent = '  '.repeat(level);
-
-  try {
-    log.info(indent + 'Processing: ' + pageId);
-
-    const title = await getPageTitle(pageId);
-    log.debug(indent + 'Title: "' + title + '"');
-
-    const markdown = await convertPageToMarkdown(pageId);
-
-    const frontmatter = generateFrontmatter(title, pageId, parentPath, level);
+const indent = '  '.repeat(level);
+try {
+log.info(indent + 'Processing: ' + pageId);
+const title = await getPageTitle(pageId);
+log.debug(indent + 'Title: "' + title + '"');
+const markdown = await convertPageToMarkdown(pageId);
+const frontmatter = generateFrontmatter(title, pageId, parentPath, level);
 const fullMarkdown = frontmatter + markdown;
 await ensureDir(parentPath);
 const filename = sanitizeFilename(title) + '.md';
