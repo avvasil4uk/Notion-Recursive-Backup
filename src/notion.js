@@ -191,7 +191,6 @@ async function queryDatabaseRows(databaseId) {
   const seenRowIds = new Set();
 
   if (dataSources.length === 0) {
-    // Fallback if database has no data_sources array
     let cursor = undefined;
     do {
       const body = cursor ? { start_cursor: cursor, page_size: 100 } : { page_size: 100 };
@@ -246,14 +245,12 @@ export async function processDatabase(databaseId, dbTitle, parentPath, level) {
     const dbDir = path.join(parentPath, safeName);
     await ensureDir(dbDir);
 
-    // Collect all unique property column names across rows
     const columnSet = new Set();
     for (const row of rows) {
       Object.keys(row.properties || {}).forEach(k => columnSet.add(k));
     }
     const columns = Array.from(columnSet);
 
-    // Build Markdown table + CSV
     const mdLines = [
       generateFrontmatter(resolvedTitle, databaseId, parentPath, level).trimEnd(),
       '',
@@ -287,7 +284,6 @@ export async function processDatabase(databaseId, dbTitle, parentPath, level) {
     log.success(`${indent}Saved Database (${rows.length} rows): ${safeName}`);
     stats.pagesProcessed++;
 
-    // Recursively back up each database row's page content
     for (const row of rows) {
       try {
         await processPageRecursively(row.id, dbDir, level + 1);
@@ -314,10 +310,12 @@ export async function processPage(pageId, parentPath, level) {
     const title = await getPageTitle(pageId);
     log.debug(`${indent}Title: "${title}"`);
 
-const markdown = await convertPageToMarkdown(pageId);
-const frontmatter = generateFrontmatter(title, pageId, parentPath, level);
-const fullMarkdown = frontmatter + markdown;
-await ensureDir(parentPath);
+    const markdown = await convertPageToMarkdown(pageId);
+
+    const frontmatter = generateFrontmatter(title, pageId, parentPath, level);
+    const fullMarkdown = frontmatter + markdown;
+
+    await ensureDir(parentPath);
 const filename = sanitizeFilename(title) + '.md';
 const filepath = path.join(parentPath, filename);
 await fs.writeFile(filepath, fullMarkdown, 'utf8');
