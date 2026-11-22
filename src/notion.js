@@ -1,5 +1,3 @@
-import { Client } from '@notionhq/client';
-import { NotionConverter } from 'notion-to-md';
 import fs from 'fs/promises';
 import * as path from 'path';
 import {
@@ -12,15 +10,17 @@ import {
   generateFrontmatter
 } from './utils.js';
 
-const NOTION_TOKEN = process.env.NOTION_TOKEN;
+const NOTION_TOKEN = (process.env.NOTION_TOKEN || '').trim();
 const NOTION_API_VERSION = '2025-09-03';
 
-const notion = new Client({ auth: NOTION_TOKEN });
-const n2m = new NotionConverter(notion);
+function cleanId(id) {
+  return String(id || '').trim().replace(/[^a-fA-F0-9-]/g, '');
+}
 
 async function notionFetch(endpoint, options = {}) {
   await sleep(CONFIG.API_DELAY);
-  const res = await fetch('https://notion.com' + endpoint, {
+  const url = 'https://notion.com' + endpoint;
+  const res = await fetch(url, {
     ...options,
     headers: {
       'Authorization': 'Bearer ' + NOTION_TOKEN,
@@ -30,11 +30,15 @@ async function notionFetch(endpoint, options = {}) {
     }
   });
 
+  const rawText = await res.text();
   if (!res.ok) {
-    const errBody = await res.text();
-    throw new Error('Notion API ' + res.status + ' on ' + endpoint + ': ' + errBody);
+    throw new Error('Notion API ' + res.status + ' on ' + url + ': ' + rawText.slice(0, 300));
   }
-  return res.json();
+  try {
+    return JSON.parse(rawText);
+  } catch (e) {
+    throw new Error('Non-JSON response from ' + url + ' (status ' + res.status + '): ' + rawText.slice(0, 120));
+  }
 }
 
 function richTextToMarkdown(richTextArr) {
@@ -52,14 +56,15 @@ function richTextToMarkdown(richTextArr) {
   }).join('');
 }
 
-async function fallbackBlocksToMarkdown(blockId, depth = 0) {
+async function blocksToMarkdown(blockId, depth = 0) {
+  const id = cleanId(blockId);
   const lines = [];
   const prefix = '  '.repeat(depth);
   let cursor = undefined;
 
   do {
     const query = cursor ? '?page_size=100&start_cursor=' + encodeURIComponent(cursor) : '?page_size=100';
-    const res = await notionFetch('/blocks/' + blockId + '/children' + query);
+    const res = await notionFetch('/blocks/' + id + '/children' + query);
 
     for (const block of (res.results || [])) {
       const type = block.type;
@@ -114,7 +119,7 @@ async function fallbackBlocksToMarkdown(blockId, depth = 0) {
           lines.push('');
           break;
         case 'child_page':
-          lines.push(prefix + '- 📄 **[' + (data.title || 'Subpage') + ']**');
+          lines.push(prefix + '- 📄 **' + (data.title || 'Subpage') + '**');
           break;
         case 'child_database':
           lines.push(prefix + '- 🗄️ **Database: ' + (data.title || 'Untitled Database') + '** *(exported in subfolder)*');
@@ -135,7 +140,7 @@ async function fallbackBlocksToMarkdown(blockId, depth = 0) {
       }
 
       if (block.has_children && type !== 'child_page' && type !== 'child_database') {
-        const childMd = await fallbackBlocksToMarkdown(block.id, depth + 1);
+        const childMd = await blocksToMarkdown(block.id, depth + 1);
         if (childMd) lines.push(childMd);
       }
     }
@@ -147,7 +152,8 @@ async function fallbackBlocksToMarkdown(blockId, depth = 0) {
 }
 
 async function queryDatabaseRows(databaseId) {
-  const dbInfo = await notionFetch('/databases/' + databaseId);
+  const id = cleanId(databaseId);
+  const dbInfo = await notionFetch('/databases/' + id);
   const dataSources = dbInfo.data_sources || [];
   const allRows = [];
   const seenRowIds = new Set();
@@ -156,7 +162,7 @@ async function queryDatabaseRows(databaseId) {
     let cursor = undefined;
     do {
       const body = cursor ? { start_cursor: cursor, page_size: 100 } : { page_size: 100 };
-      const res = await notionFetch('/databases/' + databaseId + '/query', {
+      const res = await notionFetch('/databases/' + id + '/query', {
         method: 'POST',
         body: JSON.stringify(body)
       });
@@ -175,7 +181,7 @@ async function queryDatabaseRows(databaseId) {
     let cursor = undefined;
     do {
       const body = cursor ? { start_cursor: cursor, page_size: 100 } : { page_size: 100 };
-      const res = await notionFetch('/data_sources/' + ds.id + '/query', {
+      const res = await notionFetch('/data_sources/' + cleanId(ds.id) + '/query', {
         method: 'POST',
         body: JSON.stringify(body)
       });
@@ -243,22 +249,24 @@ function extractPropertyValue(prop) {
 }
 
 export async function getPageTitle(pageId) {
+  const id = cleanId(pageId);
   try {
-    const page = await notionFetch('/pages/' + pageId);
+    const page = await notionFetch('/pages/' + id);
     const properties = page.properties || {};
     const titleProp = Object.values(properties).find(prop => prop.type === 'title');
 
     if (titleProp && titleProp.title && titleProp.title.length > 0) {
       return titleProp.title.map(t => t.plain_text).join('');
     }
-    return 'Untitled-' + pageId.substring(0, 8);
+    return 'Untitled-' + id.substring(0, 8);
   } catch (error) {
-    log.error('Failed to retrieve title for ' + pageId + ': ' + error.message);
-    return 'Untitled-' + pageId.substring(0, 8);
+    log.error('Failed to retrieve title for ' + id + ': ' + error.message);
+    return 'Untitled-' + id.substring(0, 8);
   }
 }
 
 export async function getChildItems(blockId) {
+  const id = cleanId(blockId);
   const childPages = [];
   const childDatabases = [];
   let cursor = undefined;
@@ -266,7 +274,7 @@ export async function getChildItems(blockId) {
   try {
     do {
       const query = cursor ? '?page_size=100&start_cursor=' + encodeURIComponent(cursor) : '?page_size=100';
-      const response = await notionFetch('/blocks/' + blockId + '/children' + query);
+      const response = await notionFetch('/blocks/' + id + '/children' + query);
 
       if (response.results && response.results.length) {
         for (const block of response.results) {
@@ -293,27 +301,21 @@ export async function getChildItems(blockId) {
 
     return { childPages, childDatabases };
   } catch (error) {
-    log.error('Failed to retrieve child items for ' + blockId + ': ' + error.message);
+    log.error('Failed to retrieve child items for ' + id + ': ' + error.message);
     return { childPages: [], childDatabases: [] };
   }
 }
 
 export async function convertPageToMarkdown(pageId) {
-  try {
-    await sleep(CONFIG.API_DELAY);
-    const page = await n2m.convert(pageId);
-    return page.content;
-  } catch (error) {
-    log.warn('notion-to-md failed on ' + pageId + ' (' + error.message + '), using 2025-09-03 fallback converter');
-    return await fallbackBlocksToMarkdown(pageId);
-  }
+  return await blocksToMarkdown(pageId);
 }
 
 export async function processDatabase(databaseId, dbTitle, parentPath, level) {
-const indent = '  '.repeat(level);
+  const indent = '  '.repeat(level);
+const id = cleanId(databaseId);
 try {
-log.info(indent + 'Processing Database: "' + dbTitle + '" (' + databaseId + ')');
-const { dbInfo, rows } = await queryDatabaseRows(databaseId);
+log.info(indent + 'Processing Database: "' + dbTitle + '" (' + id + ')');
+const { dbInfo, rows } = await queryDatabaseRows(id);
 const resolvedTitle =
 (dbInfo.title || []).map(t => t.plain_text).join('') || dbTitle || 'Untitled-Database';
 const safeName = sanitizeFilename(resolvedTitle);
@@ -325,7 +327,7 @@ Object.keys(row.properties || {}).forEach(k => columnSet.add(k));
 }
 const columns = Array.from(columnSet);
 const mdLines = [
-generateFrontmatter(resolvedTitle, databaseId, parentPath, level).trimEnd(),
+generateFrontmatter(resolvedTitle, id, parentPath, level).trimEnd(),
 '',
 '# ' + resolvedTitle,
 '',
@@ -360,18 +362,19 @@ stats.errors++;
 }
 }
 } catch (error) {
-log.error(indent + 'Failed to process database "' + dbTitle + '" (' + databaseId + '): ' + error.message);
+log.error(indent + 'Failed to process database "' + dbTitle + '" (' + id + '): ' + error.message);
 stats.errors++;
 }
 }
 export async function processPage(pageId, parentPath, level) {
 const indent = '  '.repeat(level);
+const id = cleanId(pageId);
 try {
-log.info(indent + 'Processing: ' + pageId);
-const title = await getPageTitle(pageId);
+log.info(indent + 'Processing: ' + id);
+const title = await getPageTitle(id);
 log.debug(indent + 'Title: "' + title + '"');
-const markdown = await convertPageToMarkdown(pageId);
-const frontmatter = generateFrontmatter(title, pageId, parentPath, level);
+const markdown = await convertPageToMarkdown(id);
+const frontmatter = generateFrontmatter(title, id, parentPath, level);
 const fullMarkdown = frontmatter + markdown;
 await ensureDir(parentPath);
 const filename = sanitizeFilename(title) + '.md';
@@ -388,9 +391,10 @@ throw error;
 }
 export async function processPageRecursively(pageId, parentPath = CONFIG.OUTPUT_DIR, level = 0) {
 const indent = '  '.repeat(level);
+const id = cleanId(pageId);
 try {
-const { title } = await processPage(pageId, parentPath, level);
-const { childPages, childDatabases } = await getChildItems(pageId);
+const { title } = await processPage(id, parentPath, level);
+const { childPages, childDatabases } = await getChildItems(id);
 if (childPages.length > 0 || childDatabases.length > 0) {
 log.info(indent + 'Found ' + childPages.length + ' child page(s) and ' + childDatabases.length + ' database(s)');
 const childDir = path.join(parentPath, sanitizeFilename(title));
